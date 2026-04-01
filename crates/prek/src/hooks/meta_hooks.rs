@@ -20,7 +20,17 @@ use crate::workspace::Project;
 // When matching files (files or exclude), we need to match against the filenames
 // relative to the project root.
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, strum::AsRefStr, strum::Display, strum::EnumString)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumIter,
+    strum::EnumString,
+)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schemars", schemars(rename_all = "kebab-case"))]
 #[strum(serialize_all = "kebab-case")]
@@ -31,6 +41,11 @@ pub(crate) enum MetaHooks {
 }
 
 impl MetaHooks {
+    pub(crate) fn all_hooks() -> Vec<String> {
+        use strum::IntoEnumIterator;
+        Self::iter().map(|hook| hook.to_string()).collect()
+    }
+
     pub(crate) async fn run(
         self,
         store: &Store,

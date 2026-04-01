@@ -54,6 +54,11 @@ pub(crate) enum BuiltinHooks {
 }
 
 impl BuiltinHooks {
+    pub(crate) fn all_hooks() -> Vec<String> {
+        use strum::IntoEnumIterator;
+        Self::iter().map(|hook| hook.to_string()).collect()
+    }
+
     pub(crate) async fn run(
         self,
         _store: &Store,

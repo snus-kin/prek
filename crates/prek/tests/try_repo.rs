@@ -370,3 +370,324 @@ fn try_repo_relative_path() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn try_repo_builtin() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    // Create a file with trailing whitespace to trigger the hook
+    context
+        .work_dir()
+        .child("test.txt")
+        .write_str("test content  \n")?;
+    context.git_add(".");
+
+    cmd_snapshot!(context.filters(), context.try_repo().arg("builtin").arg("trailing-whitespace"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "builtin"
+    hooks = [
+      { id = "trailing-whitespace" },
+    ]
+
+    trim trailing whitespace.................................................Failed
+    - hook id: trailing-whitespace
+    - exit code: 1
+    - files were modified by this hook
+
+      Fixing test.txt
+
+    ----- stderr -----
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_builtin_multiple_hooks() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    // Create files that will trigger multiple builtin hooks
+    context
+        .work_dir()
+        .child("test.txt")
+        .write_str("test content  \n")?; // trailing whitespace
+    context
+        .work_dir()
+        .child("test.json")
+        .write_str(r#"{"key": "value"}"#)?; // no newline at end
+    context.git_add(".");
+
+    cmd_snapshot!(context.filters(), context.try_repo().arg("builtin")
+        .arg("trailing-whitespace")
+        .arg("end-of-file-fixer"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "builtin"
+    hooks = [
+      { id = "end-of-file-fixer" },
+      { id = "trailing-whitespace" },
+    ]
+
+    fix end of files.........................................................Failed
+    - hook id: end-of-file-fixer
+    - exit code: 1
+    - files were modified by this hook
+
+      Fixing test.json
+    trim trailing whitespace.................................................Failed
+    - hook id: trailing-whitespace
+    - exit code: 1
+    - files were modified by this hook
+
+      Fixing test.txt
+
+    ----- stderr -----
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_builtin_with_includes() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    context
+        .work_dir()
+        .child("test.txt")
+        .write_str("test content  \n")?;
+    context.git_add(".");
+
+    cmd_snapshot!(context.filters(), context.try_repo().arg("builtin")
+        .arg("trailing-whitespace"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "builtin"
+    hooks = [
+      { id = "trailing-whitespace" },
+    ]
+
+    trim trailing whitespace.................................................Failed
+    - hook id: trailing-whitespace
+    - exit code: 1
+    - files were modified by this hook
+
+      Fixing test.txt
+
+    ----- stderr -----
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_meta() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    // Create a basic config file for meta hooks to check
+    let repo_path = create_hook_repo(&context, "meta-test-repo")?;
+    context.write_pre_commit_config(&format!(
+        indoc::indoc! {r"
+        repos:
+          - repo: {}
+            rev: HEAD
+            hooks:
+              - id: test-hook
+    "},
+        repo_path.display()
+    ));
+    context.git_add(".");
+
+    let mut filters = context.filters();
+    filters.push((r"- duration: \d+\.\d+s", "- duration: [TIME]"));
+    cmd_snapshot!(filters, context.try_repo().arg("meta").arg("identity"), @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "meta"
+    hooks = [
+      { id = "identity" },
+    ]
+
+    identity.................................................................Passed
+    - hook id: identity
+    - duration: [TIME]
+
+      .pre-commit-config.yaml
+
+    ----- stderr -----
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_meta_check_hooks_apply() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    // Create a config file with a hook that doesn't apply to any files
+    let repo_path = create_hook_repo(&context, "meta-check-hooks-repo")?;
+
+    // Get the commit SHA to avoid mutable reference warning
+    let commit_sha = git_cmd(&repo_path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()?
+        .stdout;
+    let commit_sha = String::from_utf8_lossy(&commit_sha).trim().to_string();
+
+    context.write_pre_commit_config(&format!(
+        indoc::indoc! {r"
+        repos:
+          - repo: {}
+            rev: {}
+            hooks:
+              - id: test-hook
+                files: '\.nonexistent$'
+    "},
+        repo_path.display(),
+        commit_sha
+    ));
+    context.git_add(".");
+
+    cmd_snapshot!(context.filters(), context.try_repo().arg("meta").arg("check-hooks-apply"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "meta"
+    hooks = [
+      { id = "check-hooks-apply" },
+    ]
+
+    Check hooks apply........................................................Failed
+    - hook id: check-hooks-apply
+    - exit code: 1
+
+      test-hook does not apply to this repository
+
+    ----- stderr -----
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_meta_with_skip() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    let repo_path = create_hook_repo(&context, "meta-skip-repo")?;
+    context.write_pre_commit_config(&format!(
+        indoc::indoc! {r"
+        repos:
+          - repo: {}
+            rev: HEAD
+            hooks:
+              - id: test-hook
+    "},
+        repo_path.display()
+    ));
+    context.git_add(".");
+
+    let mut filters = context.filters();
+    filters.push((r"- duration: \d+\.\d+s", "- duration: [TIME]"));
+    cmd_snapshot!(filters, context.try_repo().arg("meta")
+        .arg("--skip")
+        .arg("check-hooks-apply")
+        .arg("--skip")
+        .arg("check-useless-excludes"), @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "meta"
+    hooks = [
+      { id = "identity" },
+    ]
+
+    identity.................................................................Passed
+    - hook id: identity
+    - duration: [TIME]
+
+      .pre-commit-config.yaml
+
+    ----- stderr -----
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_builtin_unknown_hook() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+
+    context.work_dir().child("test.txt").write_str("test")?;
+    context.git_add(".");
+
+    cmd_snapshot!(context.filters(), context.try_repo().arg("builtin").arg("nonexistent-hook"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "builtin"
+    hooks = [
+    ]
+
+
+    ----- stderr -----
+    error: No hooks found after filtering with the given selectors
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn try_repo_meta_unknown_hook() {
+    let context = TestContext::new();
+    context.init_project();
+
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: https://github.com/example/example
+            rev: v1.0.0
+            hooks:
+              - id: example-hook
+    "});
+    context.git_add(".");
+
+    cmd_snapshot!(context.filters(), context.try_repo().arg("meta").arg("nonexistent-hook"), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    Using generated `prek.toml`:
+    [[repos]]
+    repo = "meta"
+    hooks = [
+    ]
+
+
+    ----- stderr -----
+    error: No hooks found after filtering with the given selectors
+    "#);
+}

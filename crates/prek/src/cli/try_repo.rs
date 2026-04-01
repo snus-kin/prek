@@ -10,9 +10,10 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Value};
 
 use crate::cli::run::Selectors;
 use crate::cli::{ExitStatus, flag};
-use crate::config;
+use crate::config::{self, BuiltinHook, Manifest, MetaHook};
 use crate::git;
 use crate::git::GIT_ROOT;
+use crate::hooks::{BuiltinHooks, MetaHooks};
 use crate::printer::Printer;
 use crate::store::Store;
 use crate::warn_user;
@@ -134,11 +135,17 @@ async fn prepare_repo_and_rev<'a>(
     }
 }
 
-fn render_repo_config_toml(repo_path: &str, rev: &str, hooks: Vec<String>) -> String {
+fn render_repo_config_toml(repo: &str, rev: Option<&str>, hooks: Vec<String>) -> String {
     let mut doc = DocumentMut::new();
     let mut repo_table = toml_edit::Table::new();
-    repo_table["repo"] = toml_edit::value(repo_path);
-    repo_table["rev"] = toml_edit::value(rev);
+    repo_table["repo"] = toml_edit::value(repo);
+
+    // Only add rev for remote repositories
+    if let Some(rev_str) = rev {
+        if repo != "builtin" && repo != "meta" && repo != "local" {
+            repo_table["rev"] = toml_edit::value(rev_str);
+        }
+    }
 
     let mut hooks_array = Array::new();
     hooks_array.set_trailing_comma(true);
@@ -175,27 +182,73 @@ pub(crate) async fn try_repo(
     let store = Store::from_settings()?;
     let tmp_dir = TempDir::with_prefix_in("try-repo-", store.scratch_path())?;
 
-    let (repo_path, rev) = prepare_repo_and_rev(&repo, rev.as_deref(), tmp_dir.path())
-        .await
-        .context("Failed to determine repository and revision")?;
+    let (manifest, repo_name, rev_for_config) = match repo.as_str() {
+        "builtin" => {
+            // Create a synthetic manifest for builtin hooks
+            let hooks = BuiltinHooks::all_hooks()
+                .into_iter()
+                .filter_map(|id| BuiltinHook::from_id(&id).ok())
+                .map(|hook| config::ManifestHook {
+                    id: hook.id,
+                    name: hook.name,
+                    entry: hook.entry,
+                    language: config::Language::Rust, // Builtin hooks use Rust language
+                    options: hook.options,
+                })
+                .collect();
 
-    let store = Store::from_path(tmp_dir.path()).init()?;
-    let repo_config = config::RemoteRepo::new(repo_path.to_string(), rev.clone(), vec![]);
-    let repo_clone_path = store.clone_repo(&repo_config, None).await?;
+            let manifest = Manifest { hooks };
+            (Ok(manifest), "builtin".to_string(), None)
+        }
+        "meta" => {
+            // Create a synthetic manifest for meta hooks
+            let hooks = MetaHooks::all_hooks()
+                .into_iter()
+                .filter_map(|id| MetaHook::from_id(&id).ok())
+                .map(|hook| config::ManifestHook {
+                    id: hook.id,
+                    name: hook.name,
+                    entry: "meta".to_string(), // Meta hooks don't have a real entry
+                    language: config::Language::System, // Meta hooks use system language
+                    options: hook.options,
+                })
+                .collect();
+
+            let manifest = Manifest { hooks };
+            (Ok(manifest), "meta".to_string(), None)
+        }
+        _ => {
+            let (repo_path, rev) = prepare_repo_and_rev(&repo, rev.as_deref(), tmp_dir.path())
+                .await
+                .context("Failed to determine repository and revision")?;
+
+            let store = Store::from_path(tmp_dir.path()).init()?;
+
+            let repo_config = config::RemoteRepo::new(repo_path.to_string(), rev.clone(), vec![]);
+            let repo_clone_path = store.clone_repo(&repo_config, None).await?;
+
+            let manifest =
+                config::read_manifest(&repo_clone_path.join(prek_consts::PRE_COMMIT_HOOKS_YAML));
+
+            (manifest, repo_path.to_string(), Some(rev))
+        }
+    };
 
     let selectors = Selectors::load(&run_args.includes, &run_args.skips, GIT_ROOT.as_ref()?)?;
 
-    let manifest =
-        config::read_manifest(&repo_clone_path.join(prek_consts::PRE_COMMIT_HOOKS_YAML))?;
+    let hooks = match manifest {
+        Ok(manifest) => manifest
+            .hooks
+            .into_iter()
+            .filter(|hook| selectors.matches_hook_id(&hook.id))
+            .map(|hook| hook.id)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
 
-    let hooks = manifest
-        .hooks
-        .into_iter()
-        .filter(|hook| selectors.matches_hook_id(&hook.id))
-        .map(|hook| hook.id)
-        .collect::<Vec<_>>();
-
-    let config_str = render_repo_config_toml(&repo_path, &rev, hooks);
+    let config_str = render_repo_config_toml(&repo_name, rev_for_config.as_deref(), hooks);
     let config_file = tmp_dir.path().join(PREK_TOML);
     fs_err::tokio::write(&config_file, &config_str).await?;
 
